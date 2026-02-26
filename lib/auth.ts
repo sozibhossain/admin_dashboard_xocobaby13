@@ -80,7 +80,11 @@ export const authOptions: NextAuthOptions = {
         token.accessToken = refreshed.data.accessToken;
         token.refreshToken = refreshed.data.refreshToken;
         token.expiresAt = getTokenExpiry(refreshed.data.accessToken);
+        delete token.error;
       } catch {
+        token.accessToken = undefined;
+        token.refreshToken = undefined;
+        token.expiresAt = 0;
         token.error = "RefreshAccessTokenError";
       }
 

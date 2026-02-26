@@ -109,15 +109,59 @@ const api = axios.create({
   },
 });
 
+type AuthSession = {
+  accessToken?: string;
+  error?: string;
+};
+
 let hasAttachedAuthInterceptor = false;
+let sessionRefreshPromise: Promise<AuthSession | null> | null = null;
+
+const getSessionWithRefresh = async () => {
+  if (!sessionRefreshPromise) {
+    sessionRefreshPromise = (async () => {
+      const { getSession } = await import("next-auth/react");
+      const session = await getSession();
+      return session as AuthSession | null;
+    })().finally(() => {
+      sessionRefreshPromise = null;
+    });
+  }
+
+  return sessionRefreshPromise;
+};
+
+const isTokenExpiryError = (error: AxiosError) => {
+  if (error.response?.status !== 401) return false;
+
+  const responseData = error.response?.data as { message?: string } | undefined;
+  const message = String(responseData?.message || "");
+
+  return /invalid or expired token|token not found|jwt expired/i.test(message);
+};
+
+const forceSignOut = async () => {
+  try {
+    const { signOut } = await import("next-auth/react");
+    await signOut({ redirect: false });
+  } finally {
+    if (typeof window !== "undefined") {
+      window.location.href = "/login";
+    }
+  }
+};
 
 const attachInterceptors = () => {
   if (hasAttachedAuthInterceptor || typeof window === "undefined") return;
   hasAttachedAuthInterceptor = true;
 
   api.interceptors.request.use(async (config) => {
-    const { getSession } = await import("next-auth/react");
-    const session = await getSession();
+    const session = await getSessionWithRefresh();
+
+    if (session?.error === "RefreshAccessTokenError") {
+      await forceSignOut();
+      return Promise.reject(new AxiosError("Session expired"));
+    }
 
     if (session?.accessToken) {
       config.headers.Authorization = `Bearer ${session.accessToken}`;
@@ -125,6 +169,41 @@ const attachInterceptors = () => {
 
     return config;
   });
+
+  api.interceptors.response.use(
+    (response) => response,
+    async (error: AxiosError) => {
+      const originalRequest = error.config as (typeof error.config & {
+        _retry?: boolean;
+      }) | undefined;
+
+      if (!originalRequest || originalRequest._retry || !isTokenExpiryError(error)) {
+        return Promise.reject(error);
+      }
+
+      const requestUrl = String(originalRequest.url || "");
+      if (requestUrl.includes("/auth/login") || requestUrl.includes("/auth/refresh-token")) {
+        return Promise.reject(error);
+      }
+
+      originalRequest._retry = true;
+
+      try {
+        const session = await getSessionWithRefresh();
+        if (!session?.accessToken || session.error === "RefreshAccessTokenError") {
+          await forceSignOut();
+          return Promise.reject(error);
+        }
+
+        originalRequest.headers = originalRequest.headers ?? {};
+        originalRequest.headers.Authorization = `Bearer ${session.accessToken}`;
+        return api(originalRequest);
+      } catch (refreshError) {
+        await forceSignOut();
+        return Promise.reject(refreshError);
+      }
+    },
+  );
 };
 
 attachInterceptors();
